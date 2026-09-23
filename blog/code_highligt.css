@@ -1,0 +1,35 @@
+.code_box {
+	background: #272822;
+	overflow-x: auto; 
+	overflow-y: hidden;
+	color: #f8f8f2;
+	padding: 10px;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 13px;
+	line-height: 1.45;
+}
+.c_green {
+	color: #75715e;
+}
+.c_pink {
+	color: #f92672;
+}
+.c_yellow {
+	color: #e6db74;
+}
+.c_blue {
+	color: #66d9ef;
+}
+.c_white {
+	color: #f8f8f2;
+}
+.c_purple {
+	color: #ae81ff;
+}
+.c_brown {
+	color: #a31515;
+}
+.c_cyan {
+	color: #a6e22e;
+}
