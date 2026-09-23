@@ -1,0 +1,27 @@
+/* Ferib.dev dark.css */
+body {
+	background-color: #2e3138;
+	color: wheat;
+	font-family: sans-serif;
+}
+#main-logo {
+	filter: drop-shadow(2px 4px 6px black);
+}
+.fancy-box {
+	background-color: #00000020;
+	border: 1px solid #00000050;
+	box-shadow: 2px 2px 7px #00000076;
+}
+code {
+	background: #1b1f233d;
+}
+p, .box-text {
+	color: wheat;
+	filter: brightness(90%);
+}
+a {
+	color: lightblue;
+}
+tr:nth-child(even) {
+	background-color: #00000020;
+}
