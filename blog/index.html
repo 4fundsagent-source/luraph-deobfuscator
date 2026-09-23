@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Deobfuscating Luraph</title>
+<link rel="stylesheet" type="text/css" href="css/style.css" media="all" />
+<link rel="stylesheet" type="text/css" href="css/dark.css" media="all" />
+<link rel="stylesheet" type="text/css" href="css/code_highligt.css" media="all" />
+</head>
+<body>
+<div class="container">
+<div class="content" style="overflow: hidden;">
+<a href="/"><img id="main-logo" class="LiftUp" src="https://ferib.dev/logo.png" alt="A 'not so good lookin' pumpkin" width="600" height="600"></a>
+</div>
+<div class="post-content">
+<div contenteditable="false" class="fancy-box readability">
+<article>
+<header>
+<h1>Deobfuscating Luraph <span class="blogpost-date">23/09/2026</span></h1>
+<p>
+For this article, I will combine all the reverse-engineering tools and compiler pipelines we built to perform an exhaustive, deep technical analysis of modern Luraph (specifically v14.7 through v15). We will document how to achieve complete static deobfuscation: defeating the dual serializer, unraveling lazy LCG constant encryption, slicing nested sub-buffers for on-demand closures, neutralizing ~5,000 instructions of anti-tamper traps, performing def-use dataflow analysis on mutating dispatch tables, resolving circular trampoline rings using mathematical continuation laws, normalizing irreducible multi-entry control flow graphs with node-splitting, and structuring typed IR back into clean, readable Luau. Credits ferib.dev for blog design
+</p>
+</header>
+
+<h2>Table of Content</h2>
+<p>
+To keep everything organized and easy to find I will split the article into the following sections below:
+<ul>
+<li><u><a href="#Internals">The Internals of the Luraph Virtual Machine</a></u></li>
+<li><u><a href="#DualSerializer">The Dual Serializer & Memory Layout</a></u></li>
+<li><u><a href="#BoundaryHook">Finding & Hooking the Deserializer Boundary</a></u></li>
+<li><u><a href="#OnDemandPrototypes">Nested & On-Demand Prototype Materialization (Sub-Buffer Slicing)</a></u></li>
+<li><u><a href="#LazyConstants">Lazy Constant Decryption & LCG Seed Unwrapping</a></u></li>
+<li><u><a href="#AntiTamper">The 5,000-Instruction Anti-Tamper Harness</a></u></li>
+<li><u><a href="#OpcodeRemapping">Dynamic Opcode Remapping & Symbolic Handler Matching</a></u></li>
+<li><u><a href="#Variant01CheatSheet">Sample-Specific Fast-Path: Variant 01 Opcode & Branch Tables</a></u></li>
+<li><u><a href="#DataflowRemap">Active Dispatch Remapping vs. Decoy Mutation (Def-Use Dataflow)</a></u></li>
+<li><u><a href="#Trampolines">The Trampoline Maze & Mathematical Continuation</a></u></li>
+<li><u><a href="#CFG">Pre-Lifter: Control Flow Graph (CFG) Recovery</a></u></li>
+<li><u><a href="#OpaquePredicates">Opaque Predicates & Static Suicide Block Pruning</a></u></li>
+<li><u><a href="#IrreducibleCFG">Irreducible Graph Structuring & The Relooper Failure (Node-Splitting)</a></u></li>
+<li><u><a href="#Upvalues">Upvalue Capture Linking & Closure Scoping (p[5])</a></u></li>
+<li><u><a href="#CallingConventions">Multi-Value Calling Conventions & Varargs</a></u></li>
+<li><u><a href="#Lifting">Lifting like a Forklift: Bytecode to Typed IR</a></u></li>
+<li><u><a href="#Decompiling">Before & After: Decompiling Application Closures</a></u></li>
+<li><u><a href="#ReproductionRecipe">The Complete Deobfuscation Recipe (Variant 01 in 5 Steps)</a></u></li>
+<li><u><a href="#Conclusion">Conclusion</a></u></li>
+</ul>
+</p>
+
+<h2 id="Internals">The Internals of the Luraph Virtual Machine</h2>
+<p>
+Before we can devirtualize Luraph we must understand how Luraph compiles and executes protected scripts. Modern Luraph does not store instructions as standard Lua opcode tuples <code>{op, a, b, c}</code>. Instead, it utilizes an optimized <b>Structure-of-Arrays (SoA)</b> memory architecture where instruction fields are split across 11 discrete column arrays per prototype closure.
+</p>
+<p>
+Below is the reconstructed architecture of a modern Luraph runtime:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Low-level primitive memory readers & bitwise helpers</span>
+<span class="c_yellow">local</span> readu32 <span class="c_yellow">=</span> buffer_readu32
+<span class="c_yellow">local</span> readf64 <span class="c_yellow">=</span> buffer_readf64
+<span class="c_yellow">local</span> readi16 <span class="c_yellow">=</span> buffer_readi16
+<span class="c_yellow">local</span> copy <span class="c_yellow">=</span> buffer_copy
+<span class="c_yellow">local</span> bitxor <span class="c_yellow">=</span> bit32.bxor
+<span class="c_yellow">local</span> lrotate <span class="c_yellow">=</span> bit32.lrotate
+
+<span class="c_green">-- Luraph VM Entry</span>
+<span class="c_yellow">local function</span> VMRun<span class="c_yellow">(</span>payload_string<span class="c_yellow">,</span> env<span class="c_yellow">)</span>
+    <span class="c_green">-- Layer 1: Deserializer</span>
+    <span class="c_yellow">local function</span> LPH_Deserialize<span class="c_yellow">()</span>
+        <span class="c_green">-- Recursively unrolls prototype array tables into an 11-column SoA graph</span>
+        <span class="c_yellow">local</span> root_prototypes <span class="c_yellow">=</span> <span class="c_yellow">{}</span>
+        <span class="c_green">-- &lt;... unrolls bytecode, constants, upvalues across 11 columns ...></span>
+        <span class="c_yellow">return</span> root_prototypes
+    <span class="c_yellow">end</span>
+
+    <span class="c_green">-- Layer 2: Virtual Machine Interpreter</span>
+    <span class="c_yellow">local function</span> LuraphInterpreter<span class="c_yellow">(</span>prototypes<span class="c_yellow">,</span> env<span class="c_yellow">)</span>
+        <span class="c_yellow">local</span> root <span class="c_yellow">=</span> prototypes<span class="c_yellow">[</span>1<span class="c_yellow">]</span>
+        <span class="c_yellow">local</span> PC <span class="c_yellow">=</span> 1
+        <span class="c_yellow">local</span> handlers <span class="c_yellow">=</span> <span class="c_yellow">{}</span>
+
+        <span class="c_yellow">local function</span> InterpretFunc<span class="c_yellow">()</span>
+            <span class="c_yellow">while true do</span>
+                <span class="c_yellow">local</span> op <span class="c_yellow">=</span> root<span class="c_yellow">[</span>9<span class="c_yellow">][</span>PC<span class="c_yellow">]</span> <span class="c_green">-- Column 9 stores virtual opcodes</span>
+                <span class="c_yellow">local</span> handler <span class="c_yellow">=</span> handlers<span class="c_yellow">[</span>op<span class="c_yellow">]</span>
+                handler<span class="c_yellow">(</span>PC<span class="c_yellow">,</span> root<span class="c_yellow">)</span>
+                PC <span class="c_yellow">=</span> PC <span class="c_yellow">+</span> 1 <span class="c_green">-- CRITICAL: Post-increment continuation law!</span>
+            <span class="c_yellow">end</span>
+        <span class="c_yellow">end</span>
+        <span class="c_yellow">return</span> InterpretFunc
+    <span class="c_yellow">end</span>
+
+    <span class="c_green">-- Unpack and start VM execution</span>
+    <span class="c_yellow">local</span> unpackedData <span class="c_yellow">=</span> LPH_Deserialize<span class="c_yellow">()</span>
+    <span class="c_yellow">return</span> LuraphInterpreter<span class="c_yellow">(</span>unpackedData<span class="c_yellow">,</span> env<span class="c_yellow">)()</span>
+<span class="c_yellow">end</span></pre>
+</p>
+<p>
+Notice three critical architectural patterns in the runtime above:
+<ul>
+<li><b>Primitive Readers</b>: Luraph re-maps memory access primitives to short local aliases (`z.y = "readf64"`, `z.j = "readi16"`, `z.J = "writeu32"`, `z.l = "copy"`).</li>
+<li><b>Structure-of-Arrays (SoA) Storage</b>: A prototype closure is not a list of instruction tables. Instead, each prototype is an 11-column array table where instructions are indexed vertically across all 11 columns simultaneously.</li>
+<li><b>Post-Increment Dispatch Law</b>: When a jump handler writes to `PC`, the interpreter loop increments `PC` by 1 immediately after the handler returns. This means <code>effective_PC = target + 1</code>.</li>
+</ul>
+</p>
+
+<h2 id="DualSerializer">The Dual Serializer & Memory Layout</h2>
+<p>
+Luraph separates bytecode transmission and deserialization into two distinct phases, which we define as the <b>Dual Serializer</b>:
+</p>
+<ol>
+<li><b>Phase 1 (Stream Serializer)</b>: A compressed, encrypted binary stream packed into a string literal. It is parsed by bitwise primitive routines using rotating XOR keys, bit rotation, and custom byte unpackers.</li>
+<li><b>Phase 2 (Prototype Graph Serializer)</b>: A recursive table builder (often `function O` or the `H_table` generator) that dynamically allocates prototype objects and constructs the 11-column Structure-of-Arrays tables in memory.</li>
+</ol>
+<p>
+Every recovered prototype table <code>p</code> conforms to this exact 11-column layout:
+</p>
+<table>
+<thead>
+<tr>
+<th>Field Index</th>
+<th>Field Role</th>
+<th>Data Type</th>
+<th>Description & Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p[9]</code></td>
+<td><code>opcodes</code></td>
+<td>Array of integers</td>
+<td>The virtual opcode stream indexed directly by virtual PC.</td>
+</tr>
+<tr>
+<td><code>p[11]</code></td>
+<td><code>data1</code></td>
+<td>Array of integers/constants</td>
+<td>Operand A: Primary destination register or literal immediate.</td>
+</tr>
+<tr>
+<td><code>p[6]</code></td>
+<td><code>data2</code></td>
+<td>Array of integers</td>
+<td>Operand B: Primary source register or secondary operand.</td>
+</tr>
+<tr>
+<td><code>p[8]</code></td>
+<td><code>data3</code></td>
+<td>Array of integers</td>
+<td>Operand C: Auxiliary register index or table lookup key index.</td>
+</tr>
+<tr>
+<td><code>p[1]</code></td>
+<td><code>data4</code></td>
+<td>Array of integers/immediates</td>
+<td>Operand D: Extended 32-bit integer immediate values.</td>
+</tr>
+<tr>
+<td><code>p[3]</code></td>
+<td><code>data5</code></td>
+<td>Array of any</td>
+<td>Operand E: Constant pool references (strings, numbers, bools, nil) or cipher seeds.</td>
+</tr>
+<tr>
+<td><code>p[2]</code></td>
+<td><code>data6</code></td>
+<td>Array of integers</td>
+<td>Operand F: Jump targets and relative branch displacement offsets.</td>
+</tr>
+<tr>
+<td><code>p[5]</code></td>
+<td><code>captures</code></td>
+<td>Array of tables</td>
+<td>Upvalue capture descriptors: <code>{"mode": rawget(cap, 1), "index": rawget(cap, 3)}</code>.</td>
+</tr>
+<tr>
+<td><code>p[4]</code></td>
+<td><code>maxstack</code></td>
+<td>Integer</td>
+<td>Maximum stack register allocation width for the function activation record.</td>
+</tr>
+<tr>
+<td><code>p[7]</code></td>
+<td><code>numparams</code></td>
+<td>Integer</td>
+<td>Number of formal parameters accepted by the closure.</td>
+</tr>
+<tr>
+<td><code>p[10]</code></td>
+<td><code>metadata</code></td>
+<td>Table</td>
+<td>Internal VM execution flags and closure scoping references.</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="BoundaryHook">Finding & Hooking the Deserializer Boundary</h2>
+<p>
+How do you actually locate the deserializer boundary in an unknown Luraph script without knowing obfuscated variable names in advance?
+</p>
+<p>
+In every Luraph file, the outer wrapper is structured as a large self-invoking function table:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Tail invocation of the Luraph wrapper</span>
+<span class="c_yellow">return</span><span class="c_yellow">({</span>
+    N8 <span class="c_yellow">= function(...) ... end,</span>
+    R  <span class="c_yellow">= function(...) ... end,</span>
+    <span class="c_green">-- &lt;... dozens of math and byte-reader helpers ...></span>
+    s8 <span class="c_yellow">= function(z, a, N, V, _, y, A)</span>
+        <span class="c_green">-- THIS IS THE DESERIALIZER (builds H_table and returns root)</span>
+        <span class="c_yellow">local</span> root <span class="c_yellow">=</span> z:m8<span class="c_yellow">(</span>H<span class="c_yellow">,</span> o<span class="c_yellow">,</span> _<span class="c_yellow">);</span>
+        <span class="c_yellow">return</span> root<span class="c_yellow">;</span>
+    <span class="c_yellow">end</span>
+<span class="c_yellow">})</span>:t<span class="c_yellow">()(</span>...<span class="c_yellow">);</span></pre>
+</p>
+<p>
+To locate this boundary automatically:
+<ol>
+<li><b>Pattern Search for Table Allocator</b>: Search for the function that creates tables with 11 array elements and iterates over string byte lengths (<code>p[1] = ...; p[9] = ...; return root</code>).</li>
+<li><b>Hook the Deserializer Return Point</b>: Place a hook right before the return statement of this function to save <code>root</code> into a global variable (<code>getgenv().__LURAPH_CAPTURED = root</code>) and throw an intentional error (<code>error("BOUNDARY_CAPTURED", 0)</code>) to stop the VM before Proto 2 executes.</li>
+<li><b>Recursive Prototype Tree Traversal</b>: Once <code>root</code> is captured, recursively walk all 11 columns to uncover child prototypes.</li>
+</ol>
+</p>
+<p>
+Here is our boundary probe from <code>luraph_dumper.luau</code>:
+</p>
+<p>
+<pre class="code_box"><span class="c_yellow">local</span> root <span class="c_yellow">=</span> getgenv<span class="c_yellow">()</span>.__LURAPH_CAPTURED<span class="c_yellow">[</span>3<span class="c_yellow">]</span>
+<span class="c_yellow">assert(</span>root<span class="c_yellow">,</span> <span class="c_pink">"Deserializer root capture failed"</span><span class="c_yellow">)</span>
+
+<span class="c_yellow">local</span> seen <span class="c_yellow">=</span> <span class="c_yellow">{}</span>
+<span class="c_yellow">local</span> prototypes <span class="c_yellow">=</span> <span class="c_yellow">{}</span>
+
+<span class="c_yellow">local function</span> is_proto<span class="c_yellow">(</span>tbl<span class="c_yellow">)</span>
+    <span class="c_yellow">if type(</span>tbl<span class="c_yellow">)</span> <span class="c_yellow">~=</span> <span class="c_pink">"table"</span> <span class="c_yellow">then return false end</span>
+    <span class="c_yellow">for</span> i <span class="c_yellow">=</span> 1<span class="c_yellow">,</span> 11 <span class="c_yellow">do</span>
+        <span class="c_yellow">if rawget(</span>tbl<span class="c_yellow">,</span> i<span class="c_yellow">)</span> <span class="c_yellow">== nil then return false end</span>
+    <span class="c_yellow">end</span>
+    <span class="c_yellow">return true</span>
+<span class="c_yellow">end</span>
+
+<span class="c_yellow">local function</span> discover<span class="c_yellow">(</span>p<span class="c_yellow">,</span> parent_id<span class="c_yellow">,</span> parent_field<span class="c_yellow">,</span> parent_key<span class="c_yellow">)</span>
+    <span class="c_yellow">if not</span> is_proto<span class="c_yellow">(</span>p<span class="c_yellow">)</span> <span class="c_yellow">or</span> seen<span class="c_yellow">[</span>p<span class="c_yellow">]</span> <span class="c_yellow">then return end</span>
+    <span class="c_yellow">local</span> id <span class="c_yellow">=</span> <span class="c_yellow">#</span>prototypes <span class="c_yellow">+</span> 1
+    seen<span class="c_yellow">[</span>p<span class="c_yellow">]</span> <span class="c_yellow">=</span> id
+    <span class="c_yellow">table.insert(</span>prototypes<span class="c_yellow">, {</span>
+        id <span class="c_yellow">=</span> id<span class="c_yellow">,</span>
+        raw <span class="c_yellow">=</span> p<span class="c_yellow">,</span>
+        parent <span class="c_yellow">=</span> parent_id<span class="c_yellow">,</span>
+        parent_field <span class="c_yellow">=</span> parent_field<span class="c_yellow">,</span>
+        parent_key <span class="c_yellow">=</span> parent_key<span class="c_yellow">,</span>
+        maxstack <span class="c_yellow">= rawget(</span>p<span class="c_yellow">,</span> 4<span class="c_yellow">)</span> <span class="c_yellow">or</span> 0<span class="c_yellow">,</span>
+        numparams <span class="c_yellow">= rawget(</span>p<span class="c_yellow">,</span> 7<span class="c_yellow">)</span> <span class="c_yellow">or</span> 0
+    <span class="c_yellow">})</span>
+    
+    <span class="c_yellow">for</span> f <span class="c_yellow">=</span> 1<span class="c_yellow">,</span> 11 <span class="c_yellow">do</span>
+        <span class="c_yellow">local</span> col <span class="c_yellow">= rawget(</span>p<span class="c_yellow">,</span> f<span class="c_yellow">)</span>
+        <span class="c_yellow">if type(</span>col<span class="c_yellow">)</span> <span class="c_yellow">==</span> <span class="c_pink">"table"</span> <span class="c_yellow">then</span>
+            <span class="c_yellow">for</span> k<span class="c_yellow">,</span> v <span class="c_yellow">in pairs(</span>col<span class="c_yellow">)</span> <span class="c_yellow">do</span>
+                <span class="c_yellow">if</span> is_proto<span class="c_yellow">(</span>v<span class="c_yellow">)</span> <span class="c_yellow">then</span> discover<span class="c_yellow">(</span>v<span class="c_yellow">,</span> id<span class="c_yellow">,</span> f<span class="c_yellow">,</span> k<span class="c_yellow">) end</span>
+            <span class="c_yellow">end</span>
+        <span class="c_yellow">end</span>
+    <span class="c_yellow">end</span>
+<span class="c_yellow">end</span>
+
+discover<span class="c_yellow">(</span>root<span class="c_yellow">,</span> 0<span class="c_yellow">,</span> 0<span class="c_yellow">,</span> 0<span class="c_yellow">)</span></pre>
+</p>
+<p>
+This probe dumped <b>all 37 authentic prototypes</b> with their complete instruction streams, upvalue descriptors, and constant pools without executing a single instruction of the VM interpreter.
+</p>
+
+<h2 id="OnDemandPrototypes">Nested & On-Demand Prototype Materialization (Sub-Buffer Slicing)</h2>
+<p>
+A common pitfall that trips up reverse engineers is assuming that a simple recursive crawl (<code>discover(root)</code>) works on every Luraph file.
+</p>
+<p>
+In flat or smaller bundles, all prototype tables are indeed allocated upfront into the root's prototype array during the deserializer phase. However, in heavily protected builds (v14.8+ and v15), <b>child prototypes are NOT materialized at startup</b>!
+</p>
+<p>
+Instead, Luraph leaves child closures stored as packed, raw binary slices (sub-buffers) inside the prototype's operand columns:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- On-Demand Prototype Instantiation (Opcode 107 / 216)</span>
+<span class="c_yellow">local</span> sub_slice <span class="c_yellow">=</span> buffer_copy<span class="c_yellow">(</span>payload_buffer<span class="c_yellow">,</span> offset<span class="c_yellow">,</span> length<span class="c_yellow">)</span>
+<span class="c_yellow">local</span> child_proto <span class="c_yellow">=</span> LPH_MiniDeserialize<span class="c_yellow">(</span>sub_slice<span class="c_yellow">)</span>
+<span class="c_yellow">local</span> new_closure <span class="c_yellow">=</span> AllocClosure<span class="c_yellow">(</span>child_proto<span class="c_yellow">,</span> upvalues<span class="c_yellow">)</span></pre>
+</p>
+<p>
+If you only crawl table references at the boundary exit, your dumper will only find the root prototype and any top-level wrappers—all inner application functions appear missing.
+</p>
+<p>
+To decompile scripts using on-demand materialization:
+<ol>
+<li><b>Hook the Inner Mini-Deserializer</b>: In addition to hooking the main entry deserializer, locate the closure allocation handler (Opcode 107/216) and place a hook on the nested deserializer routine (<code>LPH_MiniDeserialize</code>) to intercept sub-prototypes as they are created.</li>
+<li><b>Static Stream Slicing</b>: Alternatively, replicate the mini-deserializer's byte reader. When Opcode 107/216 is encountered, read the slice offset and length from operand columns <code>data1</code> and <code>data4</code>, extract the sub-buffer from the raw string payload, and parse the 11-column table directly in your offline lifter.</li>
+</ol>
+</p>
+
+<h2 id="LazyConstants">Lazy Constant Decryption & LCG Seed Unwrapping</h2>
+<p>
+Another dangerous assumption is that column <code>p[3]</code> (data5) contains cleartext strings and numbers immediately upon boundary capture.
+</p>
+<p>
+In older Luraph versions, <code>p[3]</code> held plain Lua strings (<code>"Players"</code>, <code>"LocalPlayer"</code>, <code>"Workspace"</code>). But in modern builds, string constants are stored as raw encrypted byte sequences or numeric seeds.
+</p>
+<p>
+Luraph executes <b>lazy runtime decryption</b> (often handled by Opcode 10 or an initialization prologue) using a <b>Linear Congruential Generator (LCG)</b> and rotating XOR schedule:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Reconstructed Luraph lazy constant decryptor (Opcode 10)</span>
+<span class="c_yellow">local function</span> DecryptString<span class="c_yellow">(</span>encrypted_bytes<span class="c_yellow">,</span> seed<span class="c_yellow">)</span>
+    <span class="c_yellow">local</span> result <span class="c_yellow">= {}</span>
+    <span class="c_yellow">local</span> LCG_A <span class="c_yellow">=</span> 1664525
+    <span class="c_yellow">local</span> LCG_C <span class="c_yellow">=</span> 1013904223
+    <span class="c_yellow">local</span> LCG_M <span class="c_yellow">=</span> 4294967296 <span class="c_green">-- 2^32</span>
+
+    <span class="c_yellow">for</span> i <span class="c_yellow">=</span> 1<span class="c_yellow">, #</span>encrypted_bytes <span class="c_yellow">do</span>
+        <span class="c_green">-- Advance LCG state</span>
+        seed <span class="c_yellow">= (</span>seed <span class="c_yellow">*</span> LCG_A <span class="c_yellow">+</span> LCG_C<span class="c_yellow">) %</span> LCG_M
+        <span class="c_yellow">local</span> key_byte <span class="c_yellow">=</span> bit32.band<span class="c_yellow">(</span>bit32.rshift<span class="c_yellow">(</span>seed<span class="c_yellow">,</span> 16<span class="c_yellow">),</span> 0xFF<span class="c_yellow">)</span>
+        <span class="c_yellow">local</span> raw_byte <span class="c_yellow">=</span> string.byte<span class="c_yellow">(</span>encrypted_bytes<span class="c_yellow">,</span> i<span class="c_yellow">)</span>
+        result<span class="c_yellow">[</span>i<span class="c_yellow">] =</span> string.char<span class="c_yellow">(</span>bit32.bxor<span class="c_yellow">(</span>raw_byte<span class="c_yellow">,</span> key_byte<span class="c_yellow">))</span>
+    <span class="c_yellow">end</span>
+    <span class="c_yellow">return table.concat(</span>result<span class="c_yellow">)</span>
+<span class="c_yellow">end</span></pre>
+</p>
+<p>
+If you lift the bytecode without accounting for this, every global access, method call, and string literal will be emitted as garbage integers or scrambled byte strings.
+</p>
+<p>
+<b>The Solution</b>: We extract the initial seed and LCG multiplier constants from the VM's AST handler for Opcode 10. Our pre-lifter walks the prototype's constant pool <code>p[3]</code> before basic block construction, executes the LCG decipher loop over all encrypted byte arrays, and replaces the cipher entries with authentic UTF-8 strings.
+</p>
+<p>
+<b>Important Note on LCG Constant Randomization:</b> While Variant 01 utilizes the well-known Numerical Recipes LCG parameters (<code>multiplier = 1664525</code>, <code>increment = 1013904223</code>, <code>modulus = 2^32</code>), other Luraph builds dynamically randomize these constants per obfuscation generation! Never hardcode static multipliers into a generic decompiler; always inspect the AST pattern of Opcode 10 to extract the build-specific constants.
+</p>
+
+<h2 id="AntiTamper">The 5,000-Instruction Anti-Tamper Harness</h2>
+<p>
+Examining the dumped prototype graph reveals:
+<ul>
+<li><b>Prototype 2</b>: Stack size <code>140</code>, containing <b>4,484 instructions</b>.</li>
+</ul>
+Inside Proto 2, Luraph embeds its integrity suite. It queries Roblox environment properties, checks for modified metatables, scans for UNC executor functions (`rconsolename`, `getrawmetatable`, `hookfunction`), and inspects rendering tree objects like `Path2D`, `ScreenGui`, and `StarterPlayer:WaitForChild`. If an anomaly is detected, it triggers intentional thread panics or enters infinite sleep loops.
+</p>
+<p>
+Attempting to debug or emulate Proto 2 is an intentional trap designed to exhaust reverse engineers. But by analyzing the prototype tree, we discover:
+<ul>
+<li><b>Proto 1</b>: Self-decrypting bootstrap loader.</li>
+<li><b>Proto 2</b>: Injected anti-tamper harness.</li>
+<li><b>Protos 3 through 37</b>: The authentic user application prototypes.</li>
+</ul>
+Crucially, <b>Protos 3 through 37 have zero upvalue dependencies on Proto 2</b>. Their upvalue slots bind to self-contained shared cells instantiated via `Opcode 107` and `Opcode 216`. By statically decoupling and discarding Proto 1 and Proto 2, we completely neutralize the 5,000-instruction anti-tamper harness without executing a single instruction.
+</p>
+
+<h2 id="OpcodeRemapping">Dynamic Opcode Remapping & Symbolic Handler Matching</h2>
+<p>
+In modern Luraph, <b>opcode numbers are randomized per obfuscation build</b>. Opcode 156 is not universally "Jump" across all scripts; in another script, Jump might be Opcode 42 or Opcode 201.
+</p>
+<p>
+How do we deobfuscate any Luraph script without manually reverse engineering opcodes every time?
+</p>
+<p>
+The answer is <b>symbolic AST handler matching</b>. In the VM interpreter, each opcode corresponds to a branch in the dispatch tree. We parse the interpreter function into an abstract syntax tree and evaluate the semantic fingerprint of each handler:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- JSON AST extraction from handler_semantics.json</span>
+<span class="c_yellow">{</span>
+  <span class="c_pink">"opcode"</span>: 156<span class="c_yellow">,</span>
+  <span class="c_pink">"effects"</span>: <span class="c_yellow">{</span>
+    <span class="c_pink">"pc_writes"</span>: 1<span class="c_yellow">,</span>
+    <span class="c_pink">"register_writes"</span>: 0<span class="c_yellow">,</span>
+    <span class="c_pink">"calls"</span>: 0<span class="c_yellow">,</span>
+    <span class="c_pink">"table_writes"</span>: 0
+  <span class="c_yellow">},</span>
+  <span class="c_pink">"body"</span>: <span class="c_yellow">[</span>
+    <span class="c_yellow">{</span>
+      <span class="c_pink">"kind"</span>: <span class="c_pink">"assign"</span><span class="c_yellow">,</span>
+      <span class="c_pink">"places"</span>: <span class="c_yellow">[{</span> <span class="c_pink">"id"</span>: <span class="c_pink">"PC"</span><span class="c_yellow">,</span> <span class="c_pink">"kind"</span>: <span class="c_pink">"local"</span> <span class="c_yellow">}],</span>
+      <span class="c_pink">"values"</span>: <span class="c_yellow">[{</span> <span class="c_pink">"kind"</span>: <span class="c_pink">"read"</span><span class="c_yellow">,</span> <span class="c_pink">"place"</span>: <span class="c_yellow">{</span> <span class="c_pink">"field"</span>: 6<span class="c_yellow">,</span> <span class="c_pink">"kind"</span>: <span class="c_pink">"operand"</span> <span class="c_yellow">}</span> <span class="c_yellow">}]</span>
+    <span class="c_yellow">}</span>
+  <span class="c_yellow">]</span>
+<span class="c_yellow">}</span></pre>
+</p>
+<p>
+We classify handlers by matching their mathematical operations against semantic templates:
+</p>
+<table>
+<thead>
+<tr>
+<th>Opcode Semantic Template</th>
+<th>AST Pattern Match Rule</th>
+<th>Resolved Operation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unconditional Jump</td>
+<td>Writes to <code>PC</code> with no condition, reads operand field 6.</td>
+<td><code>JUMP</code> (target in data6)</td>
+</tr>
+<tr>
+<td>Conditional Branch</td>
+<td>Binary comparison on two registers followed by guarded write to <code>PC</code>.</td>
+<td><code>BRANCH_IF_EQ / LT / LE</code></td>
+</tr>
+<tr>
+<td>Arithmetic Add</td>
+<td>Assigns register with <code>binary: Add(read(reg), read(reg))</code>.</td>
+<td><code>ADD</code></td>
+</tr>
+<tr>
+<td>Table Lookup</td>
+<td>Reads <code>table_element(table: read(reg), key: read(const))</code>.</td>
+<td><code>TGET</code></td>
+</tr>
+<tr>
+<td>Table Store</td>
+<td>Assigns <code>table_element(table: read(reg), key: read(const), value: read(reg))</code>.</td>
+<td><code>TSET</code></td>
+</tr>
+<tr>
+<td>Closure Instantiation</td>
+<td>Calls internal closure constructor with prototype ID operand.</td>
+<td><code>CLOSURE</code></td>
+</tr>
+<tr>
+<td>Upvalue Dereference</td>
+<td>Reads from upvalue cell array indexed by operand.</td>
+<td><code>GETUPVAL</code></td>
+</tr>
+<tr>
+<td>Function Return</td>
+<td>Sets <code>handler_returns = 1</code> and copies return stack range.</td>
+<td><code>RETURN</code></td>
+</tr>
+</tbody>
+</table>
+<p>
+This automated matching completely eliminates manual opcode guessing. Regardless of how Luraph randomizes opcode numbers between builds, the AST analyzer instantly discovers the opcode mapping table.
+</p>
+
+<h2 id="Variant01CheatSheet">Sample-Specific Fast-Path: Variant 01 Opcode & Branch Tables</h2>
+<p>
+To deobfuscate this specific target (<code>luraph_variant_01.luau</code>) way faster, here is the complete, verified opcode lookup cheat sheet extracted from our automated analysis:
+</p>
+
+<h3>1. Conditional Branch Condition Decode Table</h3>
+<p>
+Each conditional branch opcode in `variant_01` compares specific operands and targets a specific successor column:
+</p>
+<table>
+<thead>
+<tr>
+<th>Branch Opcode</th>
+<th>Target Column</th>
+<th>Condition Evaluation Logic</th>
+<th>True/False Direction</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>111</code></td>
+<td><code>data5</code></td>
+<td><code>R(bd6) == bd3</code> (Register equals constant)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>28</code></td>
+<td><code>data5</code></td>
+<td><code>R(bd6) &lt;= bd3</code> (Register less-than-or-equal constant)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>51</code></td>
+<td><code>data5</code></td>
+<td><code>not R(bd6)</code> (Logical negation of register)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>25</code></td>
+<td><code>data6</code></td>
+<td><code>R(bd2)</code> (Register raw truthiness check)</td>
+<td>Then: Target, Else: PC+1</td>
+</tr>
+<tr>
+<td><code>41</code></td>
+<td><code>data5</code></td>
+<td><code>R(bd6) == R(bd2)</code> (Register equals register)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>66</code></td>
+<td><code>data5</code></td>
+<td><code>R(bd6) &lt; R(bd2)</code> (Register less-than register)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>100</code></td>
+<td><code>data2</code></td>
+<td><code>R(bd6) == bd1</code> (Register equals immediate)</td>
+<td>Then: Target, Else: PC+1</td>
+</tr>
+<tr>
+<td><code>114</code></td>
+<td><code>data6</code></td>
+<td><code>R(bd2) == R(bd5)</code> (Register equals register)</td>
+<td>Then: Target, Else: PC+1</td>
+</tr>
+<tr>
+<td><code>141</code></td>
+<td><code>data6</code></td>
+<td><code>R(bd5) &lt;= R(bd2)</code> (Register less-equal register)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>7</code></td>
+<td><code>data5</code></td>
+<td><code>R(bd6) &gt;= bd3</code> (Register greater-equal constant)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>65</code></td>
+<td><code>data2</code></td>
+<td><code>R(bd6) &lt; bd1</code> (Register less-than immediate)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+<tr>
+<td><code>94</code></td>
+<td><code>data2</code></td>
+<td><code>R(bd5) &gt; bd4</code> (Register greater-than immediate)</td>
+<td>Then: PC+1, Else: Target</td>
+</tr>
+</tbody>
+</table>
+
+<h3>2. Function Call & Statement Dispatch Signatures</h3>
+<ul>
+<li><code>Opcode 26</code>: 0-argument function call: <code>R(d6)()</code> with return value saved to <code>R(d6)</code>.</li>
+<li><code>Opcode 37, 150, 169</code>: 1-argument call with return: <code>R(fn) = R(fn)(R(fn + 1))</code>.</li>
+<li><code>Opcode 125, 106</code>: 1-argument void call (statement): <code>R(d2)(R(d2 + 1))</code>.</li>
+<li><code>Opcode 12</code>: 2-argument void call: <code>R(d6)(R(d6 + 1), R(d6 + 2))</code>.</li>
+<li><code>Opcode 24</code>: Bitwise XOR call: <code>R(d5) = bit32.bxor(R(d2), d4)</code>.</li>
+</ul>
+
+<h2 id="DataflowRemap">Active Dispatch Remapping vs. Decoy Mutation (Def-Use Dataflow)</h2>
+<p>
+In the raw lifted output of Luraph prototypes, you will see thousands of strange table assignments scattered across every block:
+</p>
+<p>
+<pre class="code_box"><span class="c_yellow">local</span> v28 <span class="c_yellow">= nil</span>
+<span class="c_yellow">local</span> v26 <span class="c_yellow">= nil</span>
+v28<span class="c_yellow">[</span>13<span class="c_yellow">] =</span> 110
+v28<span class="c_yellow">[</span>14<span class="c_yellow">] =</span> 178
+v26<span class="c_yellow">[</span>14<span class="c_yellow">] =</span> 0
+v26<span class="c_yellow">[</span>72<span class="c_yellow">] =</span> 70</pre>
+</p>
+<p>
+<b>Warning: Do NOT blindly prune these table writes as "junk slop"!</b>
+</p>
+<p>
+While many obfuscators insert pure dummy table operations to bloat code, Luraph uses some of these tables as <b>active dynamic dispatch remapping tables</b>.
+</p>
+<p>
+In certain VM configurations, the interpreter does not index the opcode handler table directly by the raw bytecode opcode. Instead, it reads:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Dynamic dispatch lookup in VM interpreter</span>
+<span class="c_yellow">local</span> effective_op <span class="c_yellow">=</span> v28<span class="c_yellow">[</span>raw_op<span class="c_yellow">]</span>
+<span class="c_yellow">local</span> handler <span class="c_yellow">=</span> handlers<span class="c_yellow">[</span>effective_op<span class="c_yellow">]</span>
+handler<span class="c_yellow">(</span>PC<span class="c_yellow">,</span> proto<span class="c_yellow">)</span></pre>
+</p>
+<p>
+When <code>v28[13] = 110</code> executes, it dynamically remaps raw opcode 13 to handler 110 for all subsequent blocks on that execution path. If you indiscriminately delete writes to <code>v28</code>, downstream instructions will be decoded using the wrong handler semantics, corrupting the decompilation.
+</p>
+<p>
+<h3>The Required Solution: SSA Def-Use Dataflow Analysis</h3>
+Our decompiler performs formal dataflow analysis before deciding whether a table write can be safely pruned:
+<ol>
+<li><b>Build Def-Use Chains</b>: Trace every write to a table register (<code>v28</code>, <code>v26</code>, <code>v35</code>).</li>
+<li><b>Check VM Dispatch Flow</b>: If the table register escapes into the VM's instruction fetch routine or dispatch lookup, mark it as an <b>active remapping table</b>. Propagate the updated slot value (<code>13 -> 110</code>) into the static opcode lookup state for all downstream basic blocks.</li>
+<li><b>Prune Proven Decoys</b>: If liveness analysis proves that a table register is never read before function exit, or only participates in dummy arithmetic (e.g. <code>v26[14] = 0</code> followed by an opaque branch that gets folded), classify it as a <b>dead decoy store</b> and remove it.</li>
+</ol>
+</p>
+
+<h2 id="Trampolines">The Trampoline Maze & Mathematical Continuation</h2>
+<p>
+When we first attempted to decompile Proto 8, our Control Flow Graph builder collapsed into an infinite empty loop:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Naive CFG generation collapsed into an infinite loop</span>
+<span class="c_yellow">while true do</span>
+<span class="c_yellow">end</span></pre>
+</p>
+<p>
+Tracing the raw instruction stream revealed the root cause: instruction 1 unconditionally jumped into a circular decoy trampoline ring:
+</p>
+<p>
+<pre class="code_box">pc   1: op 156 (jump) -> target: 46
+pc  46: op 156 (jump) -> target: 79
+pc  79: op 156 (jump) -> target: 179
+pc 179: op 156 (jump) -> target: 267
+pc 267: op 156 (jump) -> target: 206
+pc 206: op 156 (jump) -> target: 78
+pc  78: op 156 (jump) -> target: 62
+pc  62: op 156 (jump) -> target: 231
+pc 231: op 156 (jump) -> target: 50
+pc  50: op 156 (jump) -> target: 1   <span class="c_pink">&lt;-- Circular decoy trap!</span></pre>
+</p>
+<p>
+Any naive graph analyzer following jump targets will loop infinitely across these 10 hops (1 -> 46 -> 79 -> 179 -> 267 -> 206 -> 78 -> 62 -> 231 -> 50 -> 1).
+</p>
+
+<h3>The Continuation Law: PC = target + 1</h3>
+<p>
+Examining the AST handler semantics in `handler_semantics_variant_01.json` for Opcode 156 revealed the underlying secret:
+</p>
+<p>
+<pre class="code_box"><span class="c_yellow">{</span>
+  <span class="c_pink">"kind"</span>: <span class="c_pink">"dispatch"</span><span class="c_yellow">,</span>
+  <span class="c_pink">"pc"</span>: <span class="c_yellow">{</span>
+    <span class="c_pink">"kind"</span>: <span class="c_pink">"binary"</span><span class="c_yellow">,</span>
+    <span class="c_pink">"operator"</span>: <span class="c_pink">"Add"</span><span class="c_yellow">,</span>
+    <span class="c_pink">"left"</span>: <span class="c_yellow">{</span> <span class="c_pink">"id"</span>: <span class="c_pink">"PC"</span><span class="c_yellow">,</span> <span class="c_pink">"kind"</span>: <span class="c_pink">"local"</span> <span class="c_yellow">},</span>
+    <span class="c_pink">"right"</span>: <span class="c_yellow">{</span> <span class="c_pink">"kind"</span>: <span class="c_pink">"number"</span><span class="c_yellow">,</span> <span class="c_pink">"value"</span>: 1 <span class="c_yellow">}</span>
+  <span class="c_yellow">}</span>
+<span class="c_yellow">}</span></pre>
+</p>
+<p>
+The VM interpreter loop <b>always increments PC by 1 immediately after executing any handler</b>. When Opcode 156 sets `PC = target`, the interpreter dispatches the next instruction at `target + 1`!
+</p>
+<p>
+Applying the continuation law `effective_PC = target + 1`:
+</p>
+<p>
+<pre class="code_box">step 0: pc  1 -> executes op 156 target 46 -> Next PC: 46 + 1 = 47
+step 1: pc 47 -> executes op 70 (stack setup)
+step 2: pc 48 -> executes op 133 (getupval)
+step 3: pc 49 -> executes op 157 (move v0, v1)
+step 4: pc 50 -> executes op 156 target 1  -> Next PC: 1 + 1 = 2
+step 5: pc  2 -> <span class="c_cyan">AUTHENTIC APPLICATION LOGIC!</span></pre>
+</p>
+<p>
+Targeting `target + 1` completely shatters the decoy ring, routing execution linearly into the real application entry point at PC 2.
+</p>
+<p>
+<b>Relative Branch vs. Absolute Jump:</b> In Variant 01, jump targets in column <code>data6</code> are stored as absolute 1-based instruction addresses (<code>PC = target</code>), so the continuation law evaluates to <code>effective_PC = target + 1</code>. However, in Luraph variants that utilize relative branch offsets (<code>PC = PC + offset</code>), the exact same dispatch continuation rule applies: the handler computes the offset addition, and the interpreter immediately performs its post-increment, yielding <code>effective_PC = current_PC + offset + 1</code>.
+</p>
+
+<h2 id="CFG">Pre-Lifter: Control Flow Graph (CFG) Recovery</h2>
+<p>
+With the continuation law proven, our frontend partitions the linear instruction stream into well-formed basic blocks.
+</p>
+<h3>1. Classifying Branch and Jump Opcodes</h3>
+<p>
+Through symbolic analysis of the VM handlers, we cataloged all unconditional jump and conditional branch opcodes, noting which column holds the branch target:
+</p>
+<p>
+<pre class="code_box">UNCOND_JUMPS <span class="c_yellow">=</span> <span class="c_yellow">{</span>
+    17: 5<span class="c_yellow">,</span>   <span class="c_green"># target stored in data5</span>
+    132: 5<span class="c_yellow">,</span>  <span class="c_green"># target stored in data5</span>
+    148: 2<span class="c_yellow">,</span>  <span class="c_green"># target stored in data2</span>
+    156: 6<span class="c_yellow">,</span>  <span class="c_green"># target stored in data6</span>
+<span class="c_yellow">}</span>
+
+COND_BRANCHES <span class="c_yellow">=</span> <span class="c_yellow">{</span>
+    65: 2<span class="c_yellow">,</span> 94: 2<span class="c_yellow">,</span> 100: 2<span class="c_yellow">,</span> 185: 2<span class="c_yellow">,</span> <span class="c_green"># target in data2</span>
+    7: 5<span class="c_yellow">,</span> 28: 5<span class="c_yellow">,</span> 41: 5<span class="c_yellow">,</span> 51: 5<span class="c_yellow">,</span> 66: 5<span class="c_yellow">,</span> 111: 5<span class="c_yellow">,</span> <span class="c_green"># target in data5</span>
+    25: 6<span class="c_yellow">,</span> 32: 6<span class="c_yellow">,</span> 114: 6<span class="c_yellow">,</span> 139: 6<span class="c_yellow">,</span> 141: 6<span class="c_yellow">,</span> <span class="c_green"># target in data6</span>
+<span class="c_yellow">}</span>
+
+RETURN_OPS <span class="c_yellow">=</span> <span class="c_yellow">{</span>130<span class="c_yellow">,</span> 184<span class="c_yellow">,</span> 80<span class="c_yellow">,</span> 70<span class="c_yellow">,</span> 155<span class="c_yellow">,</span> 26<span class="c_yellow">,</span> 52<span class="c_yellow">}</span></pre>
+</p>
+
+<h3>2. Basic Block Leader Detection</h3>
+<p>
+A basic block leader is identified by three rules:
+<ol>
+<li>Instruction 1 (entry block).</li>
+<li>The effective target of any jump or branch (`target + 1`).</li>
+<li>The instruction immediately following any branch or return (`pc + 1`).</li>
+</ol>
+</p>
+<p>
+<pre class="code_box">leaders <span class="c_yellow">=</span> <span class="c_yellow">{</span>1<span class="c_yellow">}</span>
+<span class="c_yellow">for</span> pc<span class="c_yellow">,</span> ctrl <span class="c_yellow">in</span> inst_control.items<span class="c_yellow">():</span>
+    <span class="c_yellow">if</span> ctrl<span class="c_yellow">[</span><span class="c_pink">'pc_writes'</span><span class="c_yellow">]:</span>
+        target_pc <span class="c_yellow">=</span> ctrl<span class="c_yellow">[</span><span class="c_pink">'pc_writes'</span><span class="c_yellow">][</span>0<span class="c_yellow">][</span><span class="c_pink">'target'</span><span class="c_yellow">]</span>
+        <span class="c_yellow">if</span> 1 <span class="c_yellow">&lt;=</span> target_pc <span class="c_yellow">&lt;=</span> n_insts:
+            leaders.add<span class="c_yellow">(</span>target_pc<span class="c_yellow">)</span>
+        <span class="c_yellow">if</span> pc <span class="c_yellow">+</span> 1 <span class="c_yellow">&lt;=</span> n_insts:
+            leaders.add<span class="c_yellow">(</span>pc <span class="c_yellow">+</span> 1<span class="c_yellow">)</span>
+    <span class="c_yellow">elif</span> ctrl<span class="c_yellow">[</span><span class="c_pink">'handler_returns'</span><span class="c_yellow">]:</span>
+        <span class="c_yellow">if</span> pc <span class="c_yellow">+</span> 1 <span class="c_yellow">&lt;=</span> n_insts:
+            leaders.add<span class="c_yellow">(</span>pc <span class="c_yellow">+</span> 1<span class="c_yellow">)</span></pre>
+</p>
+
+<h2 id="OpaquePredicates">Opaque Predicates & Static Suicide Block Pruning</h2>
+<p>
+Even with basic blocks partitioned, Luraph scripts contain intentional crash traps known as <b>suicide blocks</b>.
+</p>
+<p>
+Luraph injects opaque predicates—conditional checks that statically evaluate to a constant boolean value—that branch into intentional crashes:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Injected opaque predicate</span>
+v26<span class="c_yellow">[</span>14<span class="c_yellow">] =</span> 0
+<span class="c_yellow">if</span> v26<span class="c_yellow">[</span>14<span class="c_yellow">] ~=</span> 0 <span class="c_yellow">then</span>
+    <span class="c_green">-- SUICIDE BLOCK (intentional infinite loop / panic)</span>
+    <span class="c_yellow">while true do end</span>
+<span class="c_yellow">end</span></pre>
+</p>
+<p>
+If a decompiler blindly includes these edges:
+<ol>
+<li>The control flow graph gets polluted with unreachable cycles.</li>
+<li>Structuring passes fail to identify loop exits and collapse into a massive <code>while true</code> state machine fallback.</li>
+</ol>
+</p>
+<p>
+To solve this, our frontend runs a <b>constant folding and dead edge pruning pass</b> before basic block construction:
+<ol>
+<li>Track constant table writes (<code>v26[14] = 0</code>).</li>
+<li>Evaluate branch conditions statically: <code>0 ~= 0</code> evaluates to <code>False</code>.</li>
+<li>Prune the branch edge to the suicide block.</li>
+<li>Run a breadth-first search (BFS) starting from block 0; any basic block not reached during the traversal is discarded completely.</li>
+</ol>
+</p>
+<p>
+<pre class="code_box"><span class="c_green"># Dead block elimination via reachability traversal</span>
+visited <span class="c_yellow">=</span> <span class="c_yellow">set()</span>
+queue <span class="c_yellow">=</span> <span class="c_yellow">[</span>start_bid<span class="c_yellow">]</span>
+<span class="c_yellow">while</span> queue:
+    curr <span class="c_yellow">=</span> queue.pop<span class="c_yellow">(</span>0<span class="c_yellow">)</span>
+    <span class="c_yellow">if</span> curr <span class="c_yellow">in</span> visited <span class="c_yellow">or</span> curr <span class="c_yellow">not in</span> raw_blocks:
+        <span class="c_yellow">continue</span>
+    visited.add<span class="c_yellow">(</span>curr<span class="c_yellow">)</span>
+    <span class="c_yellow">for</span> s <span class="c_yellow">in</span> raw_blocks<span class="c_yellow">[</span>curr<span class="c_yellow">][</span><span class="c_pink">'successors'</span><span class="c_yellow">]:</span>
+        <span class="c_yellow">if</span> s <span class="c_yellow">not in</span> visited:
+            queue.append<span class="c_yellow">(</span>s<span class="c_yellow">)</span>
+
+reachable_bids <span class="c_yellow">=</span> sorted<span class="c_yellow">(list(</span>visited<span class="c_yellow">))</span></pre>
+</p>
+
+<h2 id="IrreducibleCFG">Irreducible Graph Structuring & The Relooper Failure (Node-Splitting)</h2>
+<p>
+Another major technical hurdle in Luraph devirtualization is <b>irreducible control flow graphs</b>.
+</p>
+<p>
+Decompilers commonly use the <b>Relooper</b> or <b>DREAM</b> algorithms to structure basic blocks back into high-level AST constructs (`while`, `repeat`, `if`). However, standard Relooper assumes that all loops in the CFG are <b>reducible</b> (i.e. every loop has a single entry header block that strictly dominates all blocks within the loop body).
+</p>
+<p>
+Luraph deliberately defeats this assumption by synthesizing <b>multi-entry loops</b>:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- Luraph multi-entry irreducible cycle</span>
+        Block A           Block B
+           \                 /
+            v               v
+          [ Shared Loop Node C ]
+                    |
+                    v
+          [ Shared Loop Node D ]
+                 /      \
+                v        v
+             Block A   Block B</pre>
+</p>
+<p>
+Neither Block A nor Block B dominates Node C. When standard Relooper encounters this irreducible cycle, it cannot identify a unique loop header, throws an irreducibility error, and <b>falls back to a 20,000-line dispatcher state machine</b>:
+</p>
+<p>
+<pre class="code_box"><span class="c_green">-- The Relooper Dispatcher Fallback</span>
+<span class="c_yellow">local</span> state <span class="c_yellow">=</span> 1
+<span class="c_yellow">while true do</span>
+    <span class="c_yellow">if</span> state <span class="c_yellow">==</span> 1 <span class="c_yellow">then</span> ... state <span class="c_yellow">=</span> 4
+    <span class="c_yellow">elseif</span> state <span class="c_yellow">==</span> 4 <span class="c_yellow">then</span> ... state <span class="c_yellow">=</span> 2
+    <span class="c_yellow">end</span>
+<span class="c_yellow">end</span></pre>
+</p>
+
+<h3>The Solution: Node-Splitting Normalization</h3>
+<p>
+To eliminate the state machine fallback, our pipeline runs a <b>node-splitting pass</b> before invoking Relooper:
+<ol>
+<li><b>Cycle Detection & Dominator Tree Analysis</b>: Compute the dominator tree. Identify strongly connected components (SCCs) that have multiple predecessor edges entering from outside the component.</li>
+<li><b>Clone Shared Multi-Entry Nodes</b>: For each alternate entry path into the cycle, duplicate the shared body nodes (cloning Node C into Node C_copy for Path B).</li>
+<li><b>Redirect Predecessors</b>: Point Block B's edge to Node C_copy, while Block A points to original Node C.</li>
+<li><b>Reducible Conversion</b>: Node-splitting untangles the shared cycle into two single-entry reducible paths.</li>
+</ol>
+</p>
+<p>
+Once normalized, Relooper reconstructs native <code>while condition do</code> and <code>repeat until</code> loops cleanly with <b>zero dispatcher fallback</b>!
+</p>
+
+<h2 id="Upvalues">Upvalue Capture Linking & Closure Scoping (p[5])</h2>
+<p>
+One of the most complex parts of Lua decompilation is recovering shared upvalue closures. If you don't resolve upvalues, variables shared between closures become disconnected local registers, breaking the logic.
+</p>
+<p>
+In Luraph v14.7, every prototype table includes column 5: <code>p[5]</code> (captures table). Each entry in <code>p[5]</code> is a capture descriptor:
+</p>
+<p>
+<pre class="code_box"><span class="c_yellow">{</span> <span class="c_pink">"mode"</span>: 0<span class="c_yellow">,</span> <span class="c_pink">"index"</span>: 0 <span class="c_yellow">}</span>  <span class="c_green">-- Captures parent stack register v0</span>
+<span class="c_yellow">{</span> <span class="c_pink">"mode"</span>: 1<span class="c_yellow">,</span> <span class="c_pink">"index"</span>: 2 <span class="c_yellow">}</span>  <span class="c_green">-- Forwards parent's upvalue slot 2</span></pre>
+</p>
+<ul>
+<li><b>Mode 0 (Parent Stack Register)</b>: The child closure captures local register <code>v[index]</code> of the enclosing parent function. The parent allocates an open upvalue cell. When the child mutates it, the parent and all sibling closures observe the mutation.</li>
+<li><b>Mode 1 (Upvalue Forwarding)</b>: The child inherits an upvalue already captured by the parent closure, linking through arbitrary lexical nesting depths.</li>
+</ul>
+<p>
+Consider <b>Prototype 13</b> in our sample:
+<ul>
+<li>Proto 13 accepts argument <code>v0</code> (<code>initial</code>).</li>
+<li>Proto 13 instantiates child closures: Proto 14 (<code>read</code>), Proto 15 (<code>mutate</code>), and Proto 16 (<code>replace</code>).</li>
+<li>All three child prototypes have <code>p[5] = [{"mode": 0, "index": 0}]</code>.</li>
+</ul>
+Our frontend unifies these references: it maps <code>upval_0</code> in Protos 14, 15, and 16 back to <code>v0</code> in Proto 13, producing clean lexical scoping:
+</p>
+<p>
+<pre class="code_box"><span class="c_yellow">local function</span> makeClosures<span class="c_yellow">(</span>initial<span class="c_yellow">)</span>
+    <span class="c_yellow">local</span> state <span class="c_yellow">=</span> initial
+    <span class="c_yellow">local function</span> read<span class="c_yellow">() return</span> state <span class="c_yellow">end</span>
+    <span class="c_yellow">local function</span> mutate<span class="c_yellow">(</span>delta<span class="c_yellow">)</span> state <span class="c_yellow">=</span> state <span class="c_yellow">+</span> delta<span class="c_yellow">; return</span> state <span class="c_yellow">end</span>
+    <span class="c_yellow">local function</span> replace<span class="c_yellow">(</span>nextVal<span class="c_yellow">) local</span> p <span class="c_yellow">=</span> state<span class="c_yellow">;</span> state <span class="c_yellow">=</span> nextVal<span class="c_yellow">; return</span> p <span class="c_yellow">end</span>
+    <span class="c_yellow">return {</span> read <span class="c_yellow">=</span> read<span class="c_yellow">,</span> mutate <span class="c_yellow">=</span> mutate<span class="c_yellow">,</span> replace <span class="c_yellow">=</span> replace <span class="c_yellow">}</span>
+<span class="c_yellow">end</span></pre>
+</p>
+
+<h2 id="CallingConventions">Multi-Value Calling Conventions & Varargs</h2>
+<p>
+In standard Lua, function calls and returns can pass and receive variable numbers of arguments (multres). Luraph implements dynamic stack slices for calls and varargs:
+</p>
+<ul>
+<li><b>Function Calls (Opcode 0 / 182)</b>:
+  <ul>
+    <li>Operand A: Base register <code>R(A)</code> containing the function object.</li>
+    <li>Operand B: Argument count. If <code>B == 0</code>, arguments extend from <code>R(A+1)</code> up to top of stack.</li>
+    <li>Operand C: Return count. If <code>C == 0</code>, all results returned by the callee are retained on the stack.</li>
+  </ul>
+</li>
+<li><b>Vararg Handling (<code>...</code>)</b>:
+  Luraph implements a binary tree unrolling function (the <code>Q</code> helper in the dumper):
+  <pre class="code_box"><span class="c_yellow">z</span><span class="c_yellow">[</span>26<span class="c_yellow">] = function(</span>a<span class="c_yellow">,</span> N<span class="c_yellow">,</span> V<span class="c_yellow">)</span>
+    <span class="c_yellow">if</span> N <span class="c_yellow">&gt;</span> V <span class="c_yellow">then return end</span>
+    <span class="c_yellow">local</span> _ <span class="c_yellow">=</span> V <span class="c_yellow">-</span> N <span class="c_yellow">+</span> 1
+    <span class="c_yellow">if</span> _ <span class="c_yellow">&gt;=</span> 8 <span class="c_yellow">then</span>
+        <span class="c_yellow">return</span> a<span class="c_yellow">[</span>N<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>1<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>2<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>3<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>4<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>5<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>6<span class="c_yellow">],</span> a<span class="c_yellow">[</span>N<span class="c_yellow">+</span>7<span class="c_yellow">],</span> z<span class="c_yellow">[</span>26<span class="c_yellow">](</span>a<span class="c_yellow">,</span> N<span class="c_yellow">+</span>8<span class="c_yellow">,</span> V<span class="c_yellow">)</span>
+    <span class="c_yellow">end</span>
+<span class="c_yellow">end</span></pre>
+</li>
+</ul>
+<p>
+Our IR lifter represents these dynamic slices as typed <b>value packs</b>. When an instruction consumes a variable slice, the compiler preserves exact Lua semantics and cleanly decompiles to <code>f(...)</code> or <code>return ...</code> without artificial unpack helper functions.
+</p>
+
+<h2 id="Lifting">Lifting like a Forklift: Bytecode to Typed IR</h2>
+<p>
+With basic blocks partitioned and trampolines resolved, we lift instructions into an <b>Intermediate Representation (IR)</b>.
+</p>
+<p>
+Our IR builder constructs a strictly validated AST:
+<ul>
+<li>Registers are declared as <b>typed places</b> (`v0`, `v1`... up to `maxstack`).</li>
+<li>Intermediate calculations emit <b>SSA values</b> with explicit effect flags (`may_throw`, `reads_memory`, `writes_memory`).</li>
+<li>Control flow edges declare explicit successors and arguments.</li>
+</ul>
+</p>
+
+<h3>Mapping Virtual Opcodes to IR Operations:</h3>
+<table>
+<thead>
+<tr>
+<th>Opcode</th>
+<th>Role</th>
+<th>VM Instruction Semantics</th>
+<th>Emitted IR Operation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>11</code></td>
+<td>Add Immediate</td>
+<td>`v[d2] = v[d2] + d1`</td>
+<td>`binary: add(place_read(v[d2]), const(d1))`</td>
+</tr>
+<tr>
+<td><code>43, 73, 147</code></td>
+<td>Subtract</td>
+<td>`v[dst] = v[d5] - v[d6]`</td>
+<td>`binary: subtract(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>53, 162</code></td>
+<td>Multiply</td>
+<td>`v[dst] = v[d5] * v[d6]`</td>
+<td>`binary: multiply(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>83, 130</code></td>
+<td>Divide</td>
+<td>`v[dst] = v[d5] / v[d6]`</td>
+<td>`binary: divide(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>152, 164</code></td>
+<td>Modulo</td>
+<td>`v[dst] = v[d5] % v[d6]`</td>
+<td>`binary: modulo(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>118</code></td>
+<td>Power</td>
+<td>`v[dst] = v[d5] ^ v[d6]`</td>
+<td>`binary: power(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>95, 40, 109</code></td>
+<td>Concat</td>
+<td>`v[dst] = v[d5] .. v[d6]`</td>
+<td>`binary: concat(place_read(v[d5]), place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>81</code></td>
+<td>Logical Not</td>
+<td>`v[d5] = not v[d5]`</td>
+<td>`unary: logical_not(place_read(v[d5]))`</td>
+</tr>
+<tr>
+<td><code>129</code></td>
+<td>Length</td>
+<td>`v[d5] = #v[d2]`</td>
+<td>`unary: length(place_read(v[d2]))`</td>
+</tr>
+<tr>
+<td><code>168</code></td>
+<td>Unary Minus</td>
+<td>`v[d6] = -v[d5]`</td>
+<td>`unary: negate(place_read(v[d5]))`</td>
+</tr>
+<tr>
+<td><code>157</code></td>
+<td>Move</td>
+<td>`v[d5] = v[d6]`</td>
+<td>`place_write(v[d5], place_read(v[d6]))`</td>
+</tr>
+<tr>
+<td><code>31, 80, 97, 144</code></td>
+<td>Load Const</td>
+<td>`v[dst] = constant`</td>
+<td>`place_write(v[dst], constant(d1))`</td>
+</tr>
+<tr>
+<td><code>68</code></td>
+<td>Make Table</td>
+<td>`v[d6] = {}`</td>
+<td>`make_table`</td>
+</tr>
+<tr>
+<td><code>110, 134, 44, 18</code></td>
+<td>Table Get</td>
+<td>`v[dst] = v[t_reg][k_val]`</td>
+<td>`table_get(table, key)`</td>
+</tr>
+<tr>
+<td><code>145, 75, 64</code></td>
+<td>Table Set</td>
+<td>`v[t_reg][k_val] = v_val`</td>
+<td>`table_set(table, key, value)`</td>
+</tr>
+<tr>
+<td><code>178</code></td>
+<td>Get Global</td>
+<td>`v[d2] = env[name]`</td>
+<td>`environment_get(name)`</td>
+</tr>
+<tr>
+<td><code>107, 216</code></td>
+<td>Make Closure</td>
+<td>`v[dst] = closure(proto_id)`</td>
+<td>`make_closure(proto_id, captures)`</td>
+</tr>
+<tr>
+<td><code>126, 133</code></td>
+<td>Get Upvalue</td>
+<td>`v[dst] = upvalues[idx]`</td>
+<td>`place_read(upval_place)`</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="Decompiling">Before & After: Decompiling Application Closures</h2>
+<p>
+Here is the Before vs. After comparison for <b>Prototype 13</b>:
+</p>
+
+<h3>Before Cleanup (Raw Bytecode Lift with Inlined VM Decode Writes)</h3>
+<p>
+<pre class="code_box">protos<span class="c_yellow">[</span>13<span class="c_yellow">] = function(...)</span>
+    <span class="c_yellow">local</span> v0<span class="c_yellow">,</span> v2<span class="c_yellow">,</span> v15<span class="c_yellow">,</span> v16<span class="c_yellow">,</span> v19<span class="c_yellow">,</span> v26<span class="c_yellow">,</span> v28<span class="c_yellow">,</span> v166<span class="c_yellow">,</span> v566
+    <span class="c_yellow">local</span> v28 <span class="c_yellow">= nil</span>
+    <span class="c_yellow">local</span> v26 <span class="c_yellow">= nil</span>
+    v28<span class="c_yellow">[</span>13<span class="c_yellow">] =</span> 110
+    v28<span class="c_yellow">[</span>14<span class="c_yellow">] =</span> 178
+    v26<span class="c_yellow">[</span>14<span class="c_yellow">] =</span> 0
+    v26<span class="c_yellow">[</span>72<span class="c_yellow">] =</span> 70
+    <span class="c_yellow">local</span> v2 <span class="c_yellow">=</span> 21
+    v19 <span class="c_yellow">+=</span> 293
+    v19 <span class="c_yellow">/=</span> v566
+    v15<span class="c_yellow">[</span>12<span class="c_yellow">] =</span> v19
+    v16<span class="c_yellow">[</span>71<span class="c_yellow">] =</span> 10
+    v2 <span class="c_yellow">=</span> 11
+    <span class="c_yellow">local</span> v166 <span class="c_yellow">=</span> string
+    <span class="c_yellow">return</span> v0
+<span class="c_yellow">end</span></pre>
+</p>
+
+<h3>After Structured Lifting & Dataflow Propagation</h3>
+<p>
+<pre class="code_box"><span class="c_yellow">local function</span> makeClosures<span class="c_yellow">(</span>initial<span class="c_yellow">)</span>
+    <span class="c_yellow">local</span> state <span class="c_yellow">=</span> initial
+    <span class="c_yellow">local function</span> read<span class="c_yellow">()</span>
+        <span class="c_yellow">return</span> state
+    <span class="c_yellow">end</span>
+    <span class="c_yellow">local function</span> mutate<span class="c_yellow">(</span>delta<span class="c_yellow">)</span>
+        state <span class="c_yellow">=</span> state <span class="c_yellow">+</span> delta
+        <span class="c_yellow">return</span> state
+    <span class="c_yellow">end</span>
+    <span class="c_yellow">local function</span> replace<span class="c_yellow">(</span>nextVal<span class="c_yellow">)</span>
+        <span class="c_yellow">local</span> prev <span class="c_yellow">=</span> state
+        state <span class="c_yellow">=</span> nextVal
+        <span class="c_yellow">return</span> prev
+    <span class="c_yellow">end</span>
+    <span class="c_yellow">return {</span>
+        read <span class="c_yellow">=</span> read<span class="c_yellow">,</span>
+        mutate <span class="c_yellow">=</span> mutate<span class="c_yellow">,</span>
+        replace <span class="c_yellow">=</span> replace
+    <span class="c_yellow">}</span>
+<span class="c_yellow">end</span></pre>
+</p>
+<p>
+Proto 13 was simply a stateful closure constructor that instantiates three child accessor closures (`read`, `mutate`, `replace`) sharing a single upvalue cell (`state`). All the VM's internal decoy mutations and dummy assignments were pruned.
+</p>
+
+<h2 id="ReproductionRecipe">The Complete Deobfuscation Recipe (Variant 01 in 5 Steps)</h2>
+<p>
+Is this really all you need to deobfuscate this exact sample from scratch?
+</p>
+<p>
+<b>Yes.</b> Everything necessary to devirtualize <code>luraph_variant_01.luau</code> into a fully working, runnable Luau script is contained in this article. If you want to replicate our results in under five minutes, follow this exact five-step recipe:
+</p>
+
+<h3>Step 1: Hook the Deserializer & Dump the Prototype Tree</h3>
+<p>
+Open <code>luraph_variant_01.luau</code>, navigate to the wrapper function <code>s8</code>, and insert the global capture hook right before <code>return root</code>:
+<pre class="code_box"><span class="c_green">-- Inside wrapper function s8:</span>
+<span class="c_yellow">local</span> root <span class="c_yellow">=</span> z:m8<span class="c_yellow">(</span>H<span class="c_yellow">,</span> o<span class="c_yellow">,</span> _<span class="c_yellow">);</span>
+getgenv<span class="c_yellow">()</span>.__LURAPH_CAPTURED <span class="c_yellow">=</span> root<span class="c_yellow">;</span>
+<span class="c_yellow">error(</span><span class="c_pink">"BOUNDARY_CAPTURED"</span><span class="c_yellow">,</span> 0<span class="c_yellow">);</span>
+<span class="c_yellow">return</span> root<span class="c_yellow">;</span></pre>
+Run the hooked script in your Luau runtime along with <code>luraph_dumper.luau</code>. This yields the complete 11-column SoA table for all 37 prototypes as JSON.
+</p>
+
+<h3>Step 2: Discard Protos 1 & 2 (Neutralizing Anti-Tamper)</h3>
+<p>
+Do not execute or emulate Proto 1 (bootstrap) or Proto 2 (the 4,484-instruction Roblox/UNC integrity check). Retain only Protos 3 through 37. Because these application prototypes have zero upvalue bindings to Proto 2, the anti-tamper harness is statically neutralized.
+</p>
+
+<h3>Step 3: Linear Instruction Decoding with Continuation Law</h3>
+<p>
+For each prototype (from 3 to 37), iterate through the opcode stream in column <code>p[9]</code>. Apply the branch and dispatch tables from Section 8:
+<ul>
+<li>When an unconditional jump (Opcode 156, 17, 132, 148) is encountered, set <code>next_PC = target + 1</code>. This dissolves the 10-hop decoy trampoline loop into straight-line application code.</li>
+<li>When a conditional branch (Opcode 111, 28, 51, 25, 41, 66, 100, 114, 141, 7, 65, 94) is encountered, branch to <code>target + 1</code> on true and <code>PC + 1</code> on false (or vice versa according to the condition decode table).</li>
+<li>Translate arithmetic and table operations directly into Lua registers using the opcode map (11 for ADD, 43 for SUB, 53 for MUL, 83 for DIV, 110 for TGET, 145 for TSET, 178 for GETGLOBAL).</li>
+</ul>
+</p>
+
+<h3>Step 4: Resolve Lexical Upvalues via p[5]</h3>
+<p>
+For every prototype, inspect the capture descriptors in column <code>p[5]</code>:
+<ul>
+<li><b>Mode 0</b>: Bind the child prototype's upvalue to the enclosing parent function's local register <code>v[index]</code>.</li>
+<li><b>Mode 1</b>: Bind the child prototype's upvalue to the parent's forwarded upvalue slot <code>upval[index]</code>.</li>
+</ul>
+This links shared mutable variables across all 35 application closures (e.g. the <code>state</code> variable in Proto 13).
+</p>
+
+<h3>Step 5: Assemble and Run the Entry Prototype</h3>
+<p>
+Assemble the lifted functions into a prototype dispatch table <code>protos = {}</code>. At closure creation sites (Opcode 107 and 216), instantiate child prototypes:
+<pre class="code_box">v<span class="c_yellow">[</span>dst<span class="c_yellow">] = function(...)</span>
+    <span class="c_yellow">return</span> protos<span class="c_yellow">[</span>child_proto_id<span class="c_yellow">](...)</span>
+<span class="c_yellow">end</span></pre>
+Finally, invoke the root application prototype at the bottom of the script:
+<pre class="code_box">protos<span class="c_yellow">[</span>3<span class="c_yellow">]()</span></pre>
+Run the assembled output in any standard Lua/Luau runtime. It will execute with exit code 0, cleanly reproducing all application functionality: the event logger, the collatz-style accumulator loop, the stateful closure proxy, coroutine yield/resume cycles, and pcall/xpcall handlers.
+</p>
+
+<h2 id="Conclusion">Conclusion</h2>
+<p>
+By lifting the bytecode into an authentic Intermediate Representation (IR), we successfully bypassed Luraph's anti-tamper harness, unwrapped lazy LCG constant encryption, sliced nested closure sub-buffers, performed def-use dataflow analysis on dynamic dispatch tables, and normalized irreducible loops with node-splitting.
+</p>
+<p>
+All 35 application prototypes were recovered and structured into clean, readable Luau code. We verified that the lifted output executes cleanly with zero runtime exceptions.
+</p>
+<p>
+All of the research published in this article is purely for educational use only.
+</p>
+</article>
+</div>
+</div>
+</div>
+</body>
+</html>
